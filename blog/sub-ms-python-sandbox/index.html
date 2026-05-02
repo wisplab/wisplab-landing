@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A 0.69 ms per-call Python sandbox in WebAssembly — Wisp</title>
+  <meta name="description" content="Cross-compiled CPython 3.14 to wasm32-wasip1, ran it under Wasmtime with a custom memory-creation path, and measured 0.69 ms p50 per-call cold start.">
+
+  <meta property="og:title" content="A 0.69 ms per-call Python sandbox in WebAssembly">
+  <meta property="og:description" content="0.69 ms p50 per-call cold start. 2394 branches/sec parallel fork. The architecture story behind a sub-millisecond Python sandbox in WebAssembly.">
+  <meta property="og:url" content="https://wisplab.org/blog/sub-ms-python-sandbox/">
+  <meta property="og:type" content="article">
+
+  <link rel="icon" type="image/png" href="/logo.png">
+  <link rel="apple-touch-icon" href="/logo.png">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --fg: #f5f5f5;
+      --muted: #a0a0a0;
+      --dim: #555;
+      --accent: #e8f0ff;
+      --line: #222;
+      --code-bg: #111;
+      --code-line: #1a1a1a;
+    }
+
+    html, body { height: 100%; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 40px 24px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .container {
+      max-width: 720px;
+      width: 100%;
+      margin: auto;
+    }
+
+    .nav {
+      margin-bottom: 3rem;
+      opacity: 0;
+      animation: fadeIn 0.6s ease-out 0.1s forwards;
+    }
+
+    .nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.95rem;
+      letter-spacing: -0.01em;
+      border-bottom: none;
+    }
+    .nav a:hover { color: var(--fg); }
+
+    h1 {
+      font-size: clamp(2rem, 5vw, 2.8rem);
+      font-weight: 300;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 0.8rem;
+      background: linear-gradient(180deg, #fff 0%, #888 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      opacity: 0;
+      animation: fadeIn 0.6s ease-out 0.2s forwards;
+    }
+
+    .meta {
+      font-size: 0.9rem;
+      color: var(--dim);
+      margin-bottom: 3rem;
+      letter-spacing: 0.02em;
+      font-variant-numeric: tabular-nums;
+      opacity: 0;
+      animation: fadeIn 0.6s ease-out 0.3s forwards;
+    }
+
+    article {
+      opacity: 0;
+      animation: fadeIn 0.6s ease-out 0.4s forwards;
+    }
+
+    article h2 {
+      font-size: 1.5rem;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+      margin-top: 3rem;
+      margin-bottom: 1rem;
+      color: var(--fg);
+    }
+
+    article h3 {
+      font-size: 1.15rem;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      color: var(--accent);
+    }
+
+    article p {
+      margin-bottom: 1rem;
+      color: #d8d8d8;
+    }
+
+    article p strong {
+      color: var(--fg);
+      font-weight: 600;
+    }
+
+    article a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid var(--line);
+      transition: border-color 0.2s;
+    }
+    article a:hover { border-bottom-color: var(--accent); }
+
+    article ul, article ol {
+      margin: 1rem 0 1rem 1.5rem;
+      color: #d8d8d8;
+    }
+    article li { margin-bottom: 0.4rem; }
+
+    article code {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      color: var(--accent);
+      padding: 0.12em 0.35em;
+      border-radius: 3px;
+      border: 1px solid var(--code-line);
+    }
+
+    article pre {
+      background: var(--code-bg);
+      border: 1px solid var(--code-line);
+      border-radius: 4px;
+      padding: 1rem 1.2rem;
+      overflow-x: auto;
+      margin: 1rem 0 1.5rem;
+      font-size: 0.85rem;
+      line-height: 1.55;
+    }
+    article pre code {
+      background: transparent;
+      border: none;
+      padding: 0;
+      color: #d8d8d8;
+      font-size: inherit;
+    }
+
+    article hr {
+      border: none;
+      border-top: 1px solid var(--line);
+      margin: 2.5rem 0;
+    }
+
+    article blockquote {
+      border-left: 2px solid var(--dim);
+      padding-left: 1.2rem;
+      margin: 1.2rem 0;
+      color: var(--muted);
+      font-style: normal;
+    }
+    article blockquote p { color: var(--muted); }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1.2rem 0 1.8rem;
+    }
+    article table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.92rem;
+    }
+    article th, article td {
+      text-align: left;
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+      color: #d0d0d0;
+    }
+    article th {
+      color: var(--muted);
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      border-bottom-color: #2a2a2a;
+    }
+    article td {
+      font-variant-numeric: tabular-nums;
+    }
+    article tbody tr:hover td { color: var(--fg); }
+
+    .footer {
+      margin-top: 4rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--line);
+      color: var(--dim);
+      font-size: 0.9rem;
+    }
+    .footer a {
+      color: var(--muted);
+      text-decoration: none;
+      border-bottom: 1px solid var(--line);
+    }
+    .footer a:hover { color: var(--fg); border-bottom-color: var(--fg); }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 480px) {
+      body { padding: 32px 18px; }
+      h1 { font-size: 1.85rem; }
+      article pre { padding: 0.75rem 0.9rem; font-size: 0.78rem; }
+      article table { font-size: 0.82rem; }
+      article th, article td { padding: 0.4rem 0.55rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <a href="/blog/">← blog</a>
+    </div>
+
+    <h1>A 0.69 ms per-call Python sandbox in WebAssembly</h1>
+    <div class="meta">2026-05-02 · Wisp</div>
+
+    <article>
+
+      <h2>TL;DR</h2>
+      <p>Cross-compiled CPython 3.14 to <code>wasm32-wasip1</code>, ran it under Wasmtime with a custom memory-creation path, and measured <strong>0.69 ms p50 per-call cold start</strong> for a fresh, isolated Python interpreter. Per-branch fork-from-snapshot lands at <strong>0.42 ms</strong> under 8-core parallel load — <strong>2394 branches/sec</strong>.</p>
+      <p>That's roughly <strong>70× faster than published serverless warm-pool numbers</strong> and <strong>2000× faster than published cold starts</strong> for similar functionality. The gap isn't optimization headroom on the existing substrates; it's that WebAssembly enables two operations native runtimes structurally cannot do — per-call fresh memory and cheap fork from arbitrary post-init state.</p>
+      <p>This post walks through what we built, why the numbers are what they are, and what's still missing.</p>
+
+      <hr>
+
+      <h2>Why a per-call sandbox?</h2>
+      <p>Two workloads make per-call isolation a feature, not an annoyance:</p>
+      <ol>
+        <li><strong>Code-execution-as-a-tool for AI agents.</strong> When a model generates a Python snippet ("compute this, parse that, normalize the JSON") and the orchestrator runs it for every turn of every conversation, the sandbox cost is paid hundreds of times per session. Today's serverless compute makes this expensive enough that most production agents either skip the sandbox (running model output in a shared process — bad) or amortize it (one persistent worker per conversation — better, but leaks state between turns and grows quadratically with concurrency).</li>
+        <li><strong>RL training over interactive environments.</strong> Tree-search rollouts (MCTS, Tree-of-Thoughts, branching GRPO) need to fork the environment state at every decision point and explore K alternative continuations. With Linux process fork at 5–10 ms and Firecracker uVM snapshots at 100–500 ms, a representative K=100 × depth=100 rollout pays 50 seconds to 80 minutes in pure fork overhead per trajectory.</li>
+      </ol>
+      <p>Both want sandboxes that are individually cheap (sub-millisecond, not millions-of-microseconds) AND independently fresh (each one a clean linear memory, no shared state with siblings).</p>
+      <p>Native processes can be one or the other but not both. Pooled-worker designs are cheap but stateful. Microvm/container per call is fresh but slow. The product space we're filling didn't have a substrate that checked both boxes.</p>
+
+      <h2>Why WebAssembly</h2>
+      <p>WebAssembly's linear memory is a single <code>mmap</code>-able byte array per instance. That makes two things trivial that aren't on a Linux process:</p>
+      <ul>
+        <li><strong>Snapshot a Python interpreter mid-execution.</strong> After <code>Py_InitializeFromConfig</code> plus your common imports (<code>json, re, math, hashlib, sqlite3, ...</code>), the entire runtime state fits in ~10 MB of linear memory. Capture once, restore per call.</li>
+        <li><strong>Reset that snapshot back to its original byte-exact state in one syscall.</strong> With the right kernel-side trick, the cost approaches the cost of a single page-table operation — no actual data motion.</li>
+      </ul>
+      <p>We don't have to invent a new sandbox primitive. The WebAssembly memory model already gives us one. The work is wiring CPython through it.</p>
+
+      <h2>Path D: build the WASI Python distribution from scratch</h2>
+      <p>We considered three other paths first and rejected them:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Path</th><th>What it is</th><th>Why it didn't fit</th></tr></thead>
+        <tbody>
+          <tr><td>A</td><td>Subprocess Wasmtime CLI per call</td><td>~400 ms per call. Bound by Wasmtime startup, not Python</td></tr>
+          <tr><td>B</td><td>Pyodide on WASI</td><td>Pyodide targets Emscripten with a JS host. Not WASI-compatible</td></tr>
+          <tr><td>C</td><td>A pooled in-process Python</td><td>Defeats per-call freshness — worker carries state</td></tr>
+          <tr><td><strong>D</strong></td><td><strong>Cross-compile CPython 3.14 to WASI from scratch</strong></td><td><strong>Hardest, but the only one with the right substrate</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p>The build uses CPython's official <code>Tools/wasm/wasi</code> driver with <a href="https://github.com/WebAssembly/wasi-sdk">wasi-sdk 32</a>. Plus our own M0.5 stdlib pass to get useful modules built in:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Module</th><th>Status</th><th>How</th></tr></thead>
+        <tbody>
+          <tr><td><code>zlib</code></td><td>✓</td><td>Cross-compile zlib-1.3.1 with wasi-sdk</td></tr>
+          <tr><td><code>sqlite3</code></td><td>✓</td><td>Cross-compile sqlite-amalgamation-3530000, link static</td></tr>
+          <tr><td><code>_hashlib</code></td><td>✓</td><td>Cross-compile OpenSSL 3.4 libcrypto only (no-sock / no-stdio for WASI)</td></tr>
+          <tr><td><code>_ssl</code></td><td>—</td><td>Skipped: WASI Preview 1 has no <code>getsockname</code> / sockets layer</td></tr>
+          <tr><td><code>_ctypes</code></td><td>—</td><td>Skipped: WASI has no executable-memory closures</td></tr>
+        </tbody>
+      </table></div>
+      <p>The result is <code>python-reactor.wasm</code>: a 34 MB WebAssembly module that exposes a small ABI:</p>
+      <pre><code>int32_t wisp_init(void);                     // initialize Python runtime + pre-imports
+int32_t wisp_eval(int32_t ptr, int32_t len); // run a Python source slice
+int32_t wisp_alloc(int32_t size);            // host writes source into linear memory here
+void    wisp_free(int32_t ptr);</code></pre>
+      <p>Built in WASI Reactor mode — <code>_initialize</code> runs once per instance, then <code>wisp_init</code> brings up CPython, then <code>wisp_eval</code> runs source. The host can interleave <code>wisp_alloc</code> / <code>wisp_eval</code> / linear-memory snapshot operations between calls.</p>
+
+      <h2>The cold-start descent</h2>
+      <p>We ran four spikes, each replacing the bottleneck of the previous one.</p>
+
+      <h3>Spike A — pooled in-process, fresh interpreter</h3>
+      <pre><code>| Subprocess wasmtime CLI    | ~400 ms |
+| Pooled in-process, init    |  39 ms  |  ← Spike A</code></pre>
+      <p>Pre-built engine, pre-compiled module, instantiate fresh, run <code>wisp_init</code> per call. The 39 ms is dominated by <code>Py_InitializeFromConfig</code> plus stdlib imports — those constitute most of CPython's startup work.</p>
+      <p>This was already 10× faster than the subprocess baseline and good enough for most workloads. But cheap relative to native ≠ cheap on its own terms. Could we cut the init cost itself?</p>
+
+      <h3>Spike A2 — memory-snapshot restore</h3>
+      <p>The trick: <code>wisp_init</code> is deterministic. Run it once, capture the linear memory, then for every subsequent call instantiate a fresh instance and restore the snapshot via <code>Memory::data_mut().copy_from_slice()</code> instead of re-running <code>wisp_init</code>.</p>
+      <pre><code>| memcpy snapshot/restore    |  1.68 ms  |  ← Spike A2</code></pre>
+      <p>23× speedup over Spike A. Now the per-call cost is ~1 ms of memcpy (10 MB at native memory bandwidth) plus ~0.6 ms of instantiate + eval. The memcpy was the dominant cost: bandwidth-bound, doesn't parallelize.</p>
+
+      <h3>Spike A2.1 — mmap COW snapshot</h3>
+      <p>Replace the per-call memcpy with a custom Wasmtime <code>MemoryCreator</code> that mmaps the snapshot file <code>MAP_PRIVATE</code>. Then per call, after instantiate, re-mmap <code>MAP_PRIVATE | MAP_FIXED</code> to undo Wasmtime's data-segment init writes:</p>
+      <pre><code>unsafe impl MemoryCreator for CowMemoryCreator {
+    fn new_memory(&amp;self, ...) -&gt; Result&lt;Box&lt;dyn LinearMemory&gt;&gt; {
+        // 1. Reserve virtual region with PROT_NONE
+        // 2. mmap MAP_PRIVATE of snapshot file at offset 0
+        //    (reads share kernel page cache; writes COW)
+        // 3. mmap MAP_PRIVATE | MAP_ANON for trailing zero pages
+    }
+}
+
+// per call:
+let r = libc::mmap(
+    base, snapshot.len(),
+    PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_FIXED,
+    snap_fd, 0,
+);</code></pre>
+      <p>Result:</p>
+      <pre><code>| mmap COW snapshot          |  0.69 ms  |  ← Spike A2.1</code></pre>
+      <p>The per-call snapshot reset dropped from a 1.07 ms memcpy to a 0.030 ms syscall. The remaining 0.66 ms decomposes:</p>
+      <pre><code>| Instantiate + data init    |   0.45 ms  ← wasmtime overhead
+| mmap MAP_FIXED reset       |   0.03 ms  ← was memcpy 1.07 ms
+| Grow memory                |   0.002 ms
+| Alloc + write code         |   0.01 ms
+| wisp_eval                  |   0.20 ms  ← page faults lazy
+| Total                      |   0.69 ms</code></pre>
+      <p>The <code>wisp_eval</code> cost rose slightly compared to A2 because pages are now faulted in lazily during execution. But this is overall a ~2.4× win, and unlike memcpy it doesn't burn memory bandwidth — meaning it should parallelize better.</p>
+
+      <h2>The other primitive: cheap fork from a snapshot</h2>
+      <p>The branching workload tells the same story from a different angle: spawn K children from a single post-init snapshot, each running a divergent Python expression.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>K</th><th>memcpy backend (br/s)</th><th>mmap COW backend (br/s)</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>367</td><td>1163</td></tr>
+          <tr><td>8</td><td>697</td><td>1702</td></tr>
+          <tr><td>64</td><td>926</td><td>2231</td></tr>
+          <tr><td>256</td><td>1025</td><td><strong>2363</strong></td></tr>
+          <tr><td>1024</td><td>799</td><td><strong>2394</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p>Peak parallel throughput on 8 cores: <strong>2394 branches/sec</strong> with the COW backend, 2.3× more than memcpy. Per-branch latency at K=64 parallel: p50 3.42 ms, p99 6.17 ms.</p>
+      <p>Comparison to native runtimes for a tree-search workload (K=100 × depth=100 = 10 000 forks per trajectory):</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Substrate</th><th>Per-trajectory branching cost</th></tr></thead>
+        <tbody>
+          <tr><td>Linux process fork</td><td>50–100 s</td></tr>
+          <tr><td>Firecracker uVM snapshot</td><td>16–83 min</td></tr>
+          <tr><td>Wisp WASM memcpy snapshot</td><td>~10 s</td></tr>
+          <tr><td><strong>Wisp WASM mmap COW snapshot</strong></td><td><strong>~4.2 s</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p>100–1000× faster than Firecracker. 10–25× faster than raw Linux fork. And every WASM child is a <em>truly fresh</em> sandbox — new linear memory, no shared state with siblings or parent beyond the snapshot contents.</p>
+
+      <h2>Where the architecture wins, and where it doesn't</h2>
+      <p>The wins:</p>
+      <ul>
+        <li><strong>Per-call freshness comes for free.</strong> Each <code>Instance</code> gets its own linear memory; there is no shared-process problem to begin with.</li>
+        <li><strong>Snapshot/restore is cheap because linear memory is just an <code>mmap</code>.</strong> Native processes can't snapshot at byte granularity without ptrace or full uVM serialization.</li>
+        <li><strong>Bytecode-determinism enables COW.</strong> Wasm execution is deterministic given the same memory + inputs. We can share read-only pages across thousands of children safely.</li>
+      </ul>
+      <p>The honest limits we measured:</p>
+      <ol>
+        <li><strong>8-core scaling is 2.0×, not 8×.</strong> With memcpy out of the way, the bottleneck moves to Wasmtime's <code>instantiate</code> (~0.45 ms per call) and kernel page-fault contention. Future work: pooling-allocator + COW together (Wasmtime today doesn't compose them); pre-faulting via <code>MAP_POPULATE</code>; cross-thread memory-image sharing.</li>
+        <li><strong><code>_ssl</code> and <code>_ctypes</code> are missing.</strong> WASI Preview 1 has no usable socket layer (<code>getsockname</code> is gated to wasip2+) and no executable-memory primitives (libffi closures need writable+executable pages). <code>_ssl</code> is mostly cosmetic anyway since the sandbox can't open sockets; <code>_ctypes</code> matters for the long tail of native-extension wheels.</li>
+        <li><strong>No third-party C extensions yet.</strong> <code>numpy</code> and friends require a build pipeline that takes a setup.py + sdist and produces a WASI wasm object. That's the next milestone (M1).</li>
+        <li><strong>Wasmtime's data-segment init runs on every instantiate.</strong> It consumes 0.45 ms of our 0.69 ms total. A "skip data init when host memory matches" feature would drop us toward 0.25 ms total.</li>
+      </ol>
+
+      <h2>Reproduce</h2>
+      <p>Everything in this post is in <a href="https://github.com/wisplab/wisp">github.com/wisplab/wisp</a>, MIT-licensed.</p>
+      <pre><code>git clone https://github.com/wisplab/wisp
+cd wisp/runtime/cpython-wasi &amp;&amp; ./build.sh        # CPython 3.14 → wasm
+./build-sqlite.sh &amp;&amp; ./build-openssl.sh           # M0.5 stdlib deps
+./wisp_entry/build.sh                              # python-reactor.wasm
+
+cd ../../bench/python-wasi-cow &amp;&amp; cargo run --release            # Spike A2.1
+cd ../python-wasi-cow-branching &amp;&amp; cargo run --release            # Spike B2</code></pre>
+      <p>Each <code>bench/*/FINDINGS.md</code> documents the measurement methodology and hardware. Apple Silicon M-series, 8 cores, Wasmtime 27 in-process.</p>
+
+      <h2>What's next</h2>
+      <p>Two tracks:</p>
+      <ol>
+        <li><strong>M1: cross-build pipeline for arbitrary Python packages.</strong> Wraps wasi-sdk + CPython headers as a build env so <code>wisp build numpy</code> produces a WASI-loadable wheel-like artifact. Gateway to numpy → pandas → scikit-learn.</li>
+        <li><strong>Spike B3: COW + pooling allocator.</strong> Today the Wasmtime pooling allocator (which would help instantiate cost) is incompatible with <code>with_host_memory</code> (which we need for COW). Resolving this should close the gap toward 8-core linear scaling.</li>
+      </ol>
+      <p>This is open-source platform work, no commercial layer. If you build on top of it, we'd love to hear what you used it for.</p>
+
+    </article>
+
+    <div class="footer">
+      <a href="/">wisplab.org</a> · <a href="/blog/">blog</a> · <a href="https://github.com/wisplab">github</a> · <a href="mailto:hello@wisplab.org">hello@wisplab.org</a>
+    </div>
+  </div>
+</body>
+</html>
