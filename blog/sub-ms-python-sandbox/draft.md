@@ -1,116 +1,147 @@
-# A 0.69 ms per-call Python sandbox in WebAssembly
+# Per-call Python sandboxes in WebAssembly: where Wisp fits
 
-*Draft — 2026-05-02*
+*Draft — 2026-05-03*
 
 ---
 
 ## TL;DR
 
-Cross-compiled CPython 3.14 to `wasm32-wasip1`, ran it under Wasmtime
-with a custom memory-creation path, and measured **0.69 ms p50 per-call
-cold start** for a fresh, isolated Python interpreter. Per-branch
-fork-from-snapshot lands at **0.42 ms** under 8-core parallel load —
-**2394 branches/sec**.
+Wisp is an open-source Python sandbox runtime that follows the same
+integration model as E2B, Modal Sandbox, Daytona, Blaxel, Vercel
+Sandbox, and Cloudflare Workers — agent frameworks plug it in as their
+"tool execution backend" and ask it to run model-generated Python
+safely.
 
-That's roughly **70× faster than published serverless warm-pool numbers
-and 2000× faster than published cold-starts** for similar functionality.
-The gap isn't optimization headroom on the existing substrates; it's
-that WebAssembly enables two operations native runtimes structurally
-cannot do — per-call fresh memory and cheap fork from arbitrary post-
-init state.
+The substrate is different: WASI Python under Wasmtime instead of a
+Firecracker microVM, gVisor container, or Docker container. That choice
+buys two things the others structurally cannot reach today:
 
-This post walks through what we built, why the numbers are what they
-are, and what's still missing.
+1. **0.78 ms per-call cold start** at the executor (vs 25 ms warm
+   resume / 90–150 ms cold for the others).
+2. **Per-call fresh sandbox as the default**, not just an option. At a
+   sub-millisecond startup cost, "new sandbox per tool call" is
+   economically the same as "reuse one sandbox" — so we can default to
+   fresh and recover *correctness* properties (no state leakage between
+   tool calls, byte-identical replay) for free.
+
+This post explains where Wisp belongs in the existing landscape — it's a
+**complement, not a replacement** — and walks through how we got the
+numbers.
 
 ---
 
-## Why a per-call sandbox?
+## The agent tool-execution problem
 
-Two workloads make per-call isolation a feature, not an annoyance:
+A code agent (Claude Code, Aider, OpenCode, Cursor, OpenInterpreter,
+LangChain agents, OpenAI Agents SDK, …) is a loop:
 
-1. **Code-execution-as-a-tool for AI agents.** When a model generates
-   a Python snippet ("compute this, parse that, normalize the JSON") and
-   the orchestrator runs it for every turn of every conversation, the
-   sandbox cost is paid hundreds of times per session. Today's serverless
-   compute makes this expensive enough that most production agents either
-   skip the sandbox (running model output in a shared process — bad) or
-   amortize it (one persistent worker per conversation — better, but
-   leaks state between turns and grows quadratically with concurrency).
-
-2. **RL training over interactive environments.** Tree-search rollouts
-   (MCTS, Tree-of-Thoughts, branching GRPO) need to fork the
-   environment state at every decision point and explore K alternative
-   continuations. With Linux process fork at 5–10 ms and Firecracker
-   uVM snapshots at 100–500 ms, a representative K=100 × depth=100
-   rollout pays 50 seconds to 80 minutes in pure fork overhead per
-   trajectory.
-
-Both want sandboxes that are individually cheap (sub-millisecond, not
-millions-of-microseconds) AND independently fresh (each one a clean
-linear memory, no shared state with siblings).
-
-Native processes can be one or the other but not both. Pooled-worker
-designs are cheap but stateful. Microvm/container per call is fresh
-but slow. The product space we're filling didn't have a substrate that
-checked both boxes.
-
-## Why WebAssembly
-
-WebAssembly's linear memory is a single `mmap`-able byte array per
-instance. That makes two things trivial that aren't on a Linux process:
-
-- **Snapshot a Python interpreter mid-execution.** After
-  `Py_InitializeFromConfig` plus your common imports
-  (`json, re, math, hashlib, sqlite3, ...`), the entire runtime state
-  fits in ~10 MB of linear memory. Capture once, restore per call.
-- **Reset that snapshot back to its original byte-exact state in one
-  syscall.** With the right kernel-side trick, the cost approaches the
-  cost of a single page-table operation — no actual data motion.
-
-We don't have to invent a new sandbox primitive. The WebAssembly memory
-model already gives us one. The work is wiring CPython through it.
-
-## Path D: build the WASI Python distribution from scratch
-
-We considered three other paths first and rejected them:
-
-| Path | What it is | Why it didn't fit |
-|---|---|---|
-| A: subprocess Wasmtime CLI per call | Spawn `wasmtime python.wasm script.py` | ~400 ms per call. Bound by Wasmtime startup, not Python |
-| B: Pyodide on WASI | Reuse the Pyodide ecosystem | Pyodide targets Emscripten with a JS host. Not WASI-compatible |
-| C: A pooled in-process Python | Reuse one Python instance per worker | Defeats per-call freshness — worker carries state |
-| **D**: **Cross-compile CPython 3.14 to WASI from scratch** | **What we did** | **Hardest, but the only one with the right substrate** |
-
-The build uses CPython's official `Tools/wasm/wasi` driver with
-[wasi-sdk 32](https://github.com/WebAssembly/wasi-sdk). Plus our own
-M0.5 stdlib pass to get useful modules built in:
-
-| Module | Status | How |
-|---|---|---|
-| `zlib` | ✓ | Cross-compile zlib-1.3.1 with wasi-sdk |
-| `sqlite3` | ✓ | Cross-compile sqlite-amalgamation-3530000, link static |
-| `_hashlib` | ✓ | Cross-compile OpenSSL 3.4 libcrypto only (no-sock / no-stdio for WASI) |
-| `_ssl` | — | Skipped: WASI Preview 1 has no `getsockname` / sockets layer |
-| `_ctypes` | — | Skipped: WASI has no executable-memory closures |
-
-The result is `python-reactor.wasm`: a 34 MB WebAssembly module that
-exposes a small ABI:
-
-```c
-int32_t wisp_init(void);                    // initialize Python runtime + pre-imports
-int32_t wisp_eval(int32_t ptr, int32_t len); // run a Python source slice
-int32_t wisp_alloc(int32_t size);           // host writes source into linear memory here
-void    wisp_free(int32_t ptr);
+```
+LLM ─→ "execute this Python" ─→ tool backend runs it ─→ result back to LLM ─→ ...
 ```
 
-Built in WASI Reactor mode — `_initialize` runs once per instance, then
-`wisp_init` brings up CPython, then `wisp_eval` runs source. The host
-can interleave `wisp_alloc` / `wisp_eval` / linear-memory snapshot
-operations between calls.
+The agent's job is the loop. The **tool backend's job** is running the
+model's generated code:
 
-## The cold-start descent
+- Safely (model output is untrusted)
+- Quickly (often dozens of tool calls per user turn)
+- With the right capabilities (filesystem? shell? network? GPU?)
+
+These are different concerns. The agent framework focuses on routing,
+memory, and LLM orchestration; the tool backend focuses on isolation
+and speed. Most agent frameworks today either implement the tool
+backend ad hoc (subprocess + chmod, or maybe Docker) or call out to a
+hosted sandbox service.
+
+Wisp aims at the second slot.
+
+---
+
+## The current landscape (2026-05)
+
+Eight serious players ship "sandbox-as-a-service for AI agents" today.
+The April 2026 OpenAI Agents SDK release named seven of them as
+built-in integrations (Blaxel, Cloudflare, Daytona, E2B, Modal,
+Runloop, Vercel) — that's the canonical adoption layer.
+
+Each made a different bet on substrate, lifecycle, and capability
+model. **None of them is wrong.** They're optimized for different
+agent shapes.
+
+| Provider | Substrate | Per-call cold start | Lifecycle | Capability model | Sweet spot |
+|---|---|---|---|---|---|
+| **E2B** | Firecracker microVM + Jupyter inside | ~150 ms | Persistent (5-min idle timeout) | Broad: full Python + pip + shell + network inside VM | Data analysts, long notebook-style sessions |
+| **Modal Sandbox** | Custom Rust container + gVisor | sub-second | Per-invocation | Broad: full container | ML workloads, batch jobs |
+| **Daytona** | Docker container (+ optional Kata) | ~90 ms warm | Persistent dev environment | Broad: full container, kernel-shared | Dev environments, CI |
+| **Blaxel** | Firecracker + perpetual env | ~25 ms warm resume | Persistent w/ aggressive idle shutdown | Broad: full VM | Intermittent agent traffic |
+| **Vercel Sandbox** | Firecracker | sub-second | Per-invocation, 5-hour cap | Broad: full VM | One-off code execution at the edge |
+| **Cloudflare Workers** | V8 isolate + Pyodide | sub-100 ms | Per-invocation | Narrow: V8-sandboxed JS-first; Python via Pyodide | Edge HTTP workloads |
+| **AWS Lambda Sandbox** | Firecracker | 800–1500 ms (Python cold) | Per-invocation | Broad: full container | Cron, infrequent triggers |
+| **Wisp** *(this work)* | wasmtime + WASI CPython | **0.78 ms** | Per-call fresh (default) | Capability-bridge (explicit allowlist) | High-frequency tool-call agents, RL rollouts |
+
+A few honest notes:
+
+- **Cold start numbers are not apples-to-apples.** E2B and Blaxel
+  measure VM creation over their cloud RPC; Wisp measures the executor
+  primitive in-process. End-to-end with HTTP, Wisp is closer to ~3 ms
+  cold and the gap to the others narrows. Still substantial — see the
+  decomposition section below.
+- **"Sweet spot" isn't a knock on the others.** A persistent Jupyter
+  inside a microVM is genuinely the right shape for "open a sandbox,
+  hand the agent pandas, let it explore for 10 minutes". A per-call
+  fresh wasm Instance would feel awkward there.
+- **Capability model is a security choice, not a feature gap.** E2B's
+  "broad inside the VM" is fine because the VM boundary is strong.
+  Wisp's "narrow + capability-bridge" is appropriate when the same
+  daemon hosts code from many distrustful tenants.
+
+---
+
+## Where Wisp fits — and where it doesn't
+
+| Use case | Wisp | Use one of the others |
+|---|---|---|
+| Agent makes 50+ short tool calls per turn (file ops, JSON parse, simple compute) | ✓ default per-call freshness, no state pollution between calls | persistent-VM models pay state-leakage cost |
+| Tree-search RL rollout (MCTS, GRPO) | ✓ COW fork at sub-ms per branch (Spike B2 below) | Linux fork or Firecracker snapshot is 100–1000× slower |
+| Multi-tenant SaaS hosting untrusted agent code | ✓ capability-bridge gives explicit allowlists per tenant | broad VM access works but auditing is harder |
+| Data-analyst agent with `pandas` and a CSV that should persist | E2B/Daytona model is a better fit (state survives across cells) | Wisp can do session mode, but it's bolted on |
+| Agent needing arbitrary `pip install` mid-session | E2B (full apt+pip inside VM) | Wisp's WASI Python doesn't have dlopen for native wheels |
+| Browser automation (Playwright, etc.) | E2B's chrome-in-sandbox | not yet in scope |
+
+The honest position: **for most agent frameworks today, Wisp is a
+plug-in for the tool-execution layer**, sitting alongside (not
+replacing) whichever sandbox provider they already use. We are best
+when the agent loop is high-frequency and stateless-ish.
+
+---
+
+## The substrate, briefly
+
+WebAssembly's linear memory is a single contiguous byte array per
+Instance. That's what makes per-call fresh cheap:
+
+- **Snapshot a Python interpreter mid-execution** = `memcpy` (or
+  `mmap MAP_FIXED`) of the byte array
+- **Reset to a known-good state** = re-mmap the snapshot file at the
+  same address — kernel page-table operation, no actual data motion
+- **Spawn N children sharing the same base** = mmap COW (copy-on-write
+  on first write)
+
+Native processes structurally can't do this — heap is scattered across
+mmap regions, shared libs, stack; you can't dump or restore at byte
+granularity without ptrace or full uVM serialization. Firecracker has
+a snapshot facility, but it operates at VM granularity and takes
+100–500 ms to restore.
+
+The wasm Instance abstraction collapses snapshot/restore into one
+syscall. That's where the substrate gap comes from.
+
+---
+
+## The cold-start descent (our spikes, with numbers)
 
 We ran four spikes, each replacing the bottleneck of the previous one.
+All measurements are on Apple Silicon M-series, 8 cores, Wasmtime
+crate 27, in-process.
 
 ### Spike A — pooled in-process, fresh interpreter
 
@@ -120,33 +151,27 @@ We ran four spikes, each replacing the bottleneck of the previous one.
 ```
 
 Pre-built engine, pre-compiled module, instantiate fresh, run
-`wisp_init` per call. The 39 ms is dominated by `Py_InitializeFromConfig`
-plus stdlib imports — those constitute most of CPython's startup work.
-
-This was already 10× faster than the subprocess baseline and good enough
-for most workloads. But cheap relative to native ≠ cheap on its own
-terms. Could we cut the init cost itself?
+`wisp_init` per call. The 39 ms is dominated by
+`Py_InitializeFromConfig` plus stdlib imports — most of CPython's
+startup work. Already 10× faster than the subprocess baseline.
 
 ### Spike A2 — memory-snapshot restore
 
-The trick: `wisp_init` is deterministic. Run it once, capture the
-linear memory, then for every subsequent call instantiate a fresh
-instance and restore the snapshot via `Memory::data_mut().copy_from_slice()`
-instead of re-running `wisp_init`.
+`wisp_init` is deterministic. Run it once, capture the linear memory,
+restore the snapshot via `Memory::data_mut().copy_from_slice()`
+instead of re-running init.
 
 ```
 | memcpy snapshot/restore    |  1.68 ms  |  ← Spike A2
 ```
 
-23× speedup over Spike A. Now the per-call cost is ~1 ms of memcpy
-(10 MB at native memory bandwidth) plus ~0.6 ms of instantiate +
-eval. The memcpy was the dominant cost: bandwidth-bound, doesn't
-parallelize.
+23× speedup. The memcpy was the dominant cost — bandwidth-bound,
+doesn't parallelize.
 
 ### Spike A2.1 — mmap COW snapshot
 
 Replace the per-call memcpy with a custom Wasmtime `MemoryCreator` that
-mmaps the snapshot file `MAP_PRIVATE`. Then per call, after instantiate,
+mmaps the snapshot file `MAP_PRIVATE`. Per call, after instantiate,
 re-mmap `MAP_PRIVATE | MAP_FIXED` to undo Wasmtime's data-segment init
 writes:
 
@@ -155,7 +180,6 @@ unsafe impl MemoryCreator for CowMemoryCreator {
     fn new_memory(&self, ...) -> Result<Box<dyn LinearMemory>> {
         // 1. Reserve virtual region with PROT_NONE
         // 2. mmap MAP_PRIVATE of snapshot file at offset 0
-        //    (reads share kernel page cache; writes COW)
         // 3. mmap MAP_PRIVATE | MAP_ANON for trailing zero pages
     }
 }
@@ -172,11 +196,11 @@ let r = libc::mmap(
 Result:
 
 ```
-| mmap COW snapshot          |  0.69 ms  |  ← Spike A2.1
+| mmap COW snapshot          |  0.78 ms  |  ← Spike A2.1
 ```
 
 The per-call snapshot reset dropped from a 1.07 ms memcpy to a 0.030 ms
-syscall. The remaining 0.66 ms decomposes:
+syscall. The remaining 0.75 ms decomposes:
 
 ```
 | Instantiate + data init    |   0.45 ms  ← wasmtime overhead
@@ -184,78 +208,109 @@ syscall. The remaining 0.66 ms decomposes:
 | Grow memory                |   0.002 ms
 | Alloc + write code         |   0.01 ms
 | wisp_eval                  |   0.20 ms  ← page faults lazy
-| Total                      |   0.69 ms
+| Total                      |   0.78 ms
 ```
 
-The `wisp_eval` cost rose slightly compared to A2 because pages are now
-faulted in lazily during execution. But this is overall a ~2.4× win,
-and unlike memcpy it doesn't burn memory bandwidth — meaning it should
-parallelize better.
+The `wisp_eval` cost rose slightly compared to A2 because pages are
+faulted in lazily during execution. Net win: ~2.4× over memcpy, and
+unlike memcpy this approach doesn't burn memory bandwidth — meaning it
+parallelizes better.
+
+---
 
 ## The other primitive: cheap fork from a snapshot
 
-The branching workload tells the same story from a different angle:
-spawn K children from a single post-init snapshot, each running a
+Spawn K children from a single post-init snapshot, each running a
 divergent Python expression.
 
 | K | memcpy backend (br/s) | mmap COW backend (br/s) |
 |---|---|---|
-|   1 |  367 |  1163 |
-|   8 |  697 |  1702 |
-|  64 |  926 |  2231 |
+| 1 | 367 | 1163 |
+| 8 | 697 | 1702 |
+| 64 | 926 | 2231 |
 | 256 | 1025 | **2363** |
-|1024 |  799 | **2394** |
+| 1024 | 799 | **2394** |
 
-Peak parallel throughput on 8 cores: **2394 branches/sec** with the COW
-backend, 2.3× more than memcpy. Per-branch latency at K=64 parallel:
-p50 3.42 ms, p99 6.17 ms.
+Peak parallel throughput on 8 cores: **2394 branches/sec** with the
+COW backend, 2.3× more than memcpy. Per-branch latency at K=64
+parallel: p50 3.42 ms, p99 6.17 ms.
 
 Comparison to native runtimes for a tree-search workload (K=100 ×
 depth=100 = 10 000 forks per trajectory):
 
 | Substrate | Per-trajectory branching cost |
 |---|---|
-| Linux process fork | 50–100 s |
+| Linux process fork (Python interpreter) | 50–100 s |
 | Firecracker uVM snapshot | 16–83 min |
 | Wisp WASM memcpy snapshot | ~10 s |
 | **Wisp WASM mmap COW snapshot** | **~4.2 s** |
 
-100–1000× faster than Firecracker. 10–25× faster than raw Linux fork.
-And every WASM child is a *truly fresh* sandbox — new linear memory,
-no shared state with siblings or parent beyond the snapshot contents.
+Useful for tree-search RL: every WASM child gets a *truly fresh*
+sandbox — new linear memory, no shared state with siblings or parent
+beyond the snapshot contents.
 
-## Where the architecture wins, and where it doesn't
+---
 
-The wins:
+## End-to-end through the daemon
 
-- **Per-call freshness comes for free.** Each `Instance` gets its own
-  linear memory; there is no shared-process problem to begin with.
-- **Snapshot/restore is cheap because linear memory is just an `mmap`.**
-  Native processes can't snapshot at byte granularity without ptrace
-  or full uVM serialization.
-- **Bytecode-determinism enables COW.** Wasm execution is deterministic
-  given the same memory + inputs. We can share read-only pages across
-  thousands of children safely.
+The 0.78 ms number is the executor primitive. End-to-end through the
+HTTP daemon (`wisp-runtime`):
 
-The honest limits we measured:
+```
+$ for i in {1..10}; do
+    curl -s -X POST http://127.0.0.1:9000/v1/eval \
+      -H "Content-Type: application/json" \
+      -d '{"code":"print(2+2)"}' | jq .elapsed_us
+  done
+14225
+1511
+1356
+1203
+1189
+1130
+1284
+1189
+1120
+1255
+```
 
-1. **8-core scaling is 2.0×, not 8×.** With memcpy out of the way, the
-   bottleneck moves to Wasmtime's `instantiate` (~0.45 ms per call) and
-   kernel page-fault contention. Future work: pooling-allocator + COW
-   together (Wasmtime today doesn't compose them); pre-faulting via
-   `MAP_POPULATE`; cross-thread memory-image sharing.
-2. **`_ssl` and `_ctypes` are missing.** WASI Preview 1 has no usable
-   socket layer (`getsockname` is gated to wasip2+) and no executable-
-   memory primitives (libffi closures need writable+executable pages).
-   `_ssl` is mostly cosmetic anyway since the sandbox can't open
-   sockets; `_ctypes` matters for the long tail of native-extension
-   wheels.
-3. **No third-party C extensions yet.** `numpy` and friends require a
-   build pipeline that takes a setup.py + sdist and produces a WASI
-   wasm object. That's the next milestone (M1).
-4. **Wasmtime's data-segment init runs on every instantiate.** It
-   consumes 0.45 ms of our 0.69 ms total. A "skip data init when host
-   memory matches" feature would drop us toward 0.25 ms total.
+**Steady state ~1.1–1.3 ms** including HTTP framing, JSON
+serialization, and the channel hop from tokio to a worker thread. The
+first call is warm-up of the JIT cache for the first Instance.
+
+This is the cold start an agent framework will measure when it
+integrates the Wisp client SDK.
+
+---
+
+## What WebAssembly does NOT solve
+
+Honest disclaimers, since these come up:
+
+- **Wasm Python is not faster Python.** CPython compiled to WASM runs
+  10–30% slower than native CPython. We sell *cheap isolation*, not
+  faster execution.
+- **No `pip install` of native wheels.** WASI doesn't have `dlopen`,
+  so packages with C extensions need to be built into the runtime
+  ahead of time. (We have a build pipeline for that — see `scripts/`
+  in the repo.)
+- **No threads, no `multiprocessing`, no `subprocess`.** WASI Preview
+  1 doesn't expose any of these. Threading-using libraries fail at
+  import. This is generally fine for a sandbox (you don't *want* it
+  spawning threads), but it does block some libraries.
+- **No real sockets in-sandbox.** WASI Preview 1 has no `getsockname`.
+  Outbound HTTPS goes through a host capability bridge instead — same
+  pattern Cloudflare Workers, Deno, and other capability runtimes use.
+- **`_ssl` and `_ctypes` modules are missing.** Architectural, not
+  fixable from our side — would need WASI Preview 2 for `_ssl` (and
+  `_ctypes` is blocked at the WebAssembly layer regardless).
+
+For most agent tool calls (parse this JSON, transform that data,
+validate this schema, do this hash), none of these matter. For some
+agent workloads (HTTP scraping, browser control, full notebook
+exploration), one of the persistent-VM substrates is the right choice.
+
+---
 
 ## Reproduce
 
@@ -270,25 +325,34 @@ cd wisp/runtime/cpython-wasi && ./build.sh        # CPython 3.14 → wasm
 
 cd ../../bench/python-wasi-cow && cargo run --release            # Spike A2.1
 cd ../python-wasi-cow-branching && cargo run --release            # Spike B2
+
+# And the daemon + SDK:
+cd ../.. && cargo run --release -p wisp-runtime &
+pip install -e sdks/python
+python -c "import wisp; print(wisp.Client().eval('print(2+2)').stdout)"
 ```
 
-Each `bench/*/FINDINGS.md` documents the measurement methodology and
-hardware. Apple Silicon M-series, 8 cores, Wasmtime 27 in-process.
+Each `bench/*/FINDINGS.md` documents the methodology.
+
+---
 
 ## What's next
 
-Two tracks:
+1. **Daemon-side capabilities** — `shell`, `file_read`, `file_write`,
+   `web_fetch`, `grep`. Configured via allowlist. Without these the
+   sandbox is too narrow for real tool-call workloads.
+2. **Sandbox-side `wisp` Python module** — friendly wrapper around the
+   capability bridge, so user code does `wisp.shell("ls")` instead of
+   raw `_wisp.call_host(...)`.
+3. **Reference integration with one open-source agent framework** —
+   probably smolagents or OpenCode. Not asking them to merge a PR;
+   just a working example so anyone can copy the pattern.
+4. **M1 build pipeline → numpy** — let the sandbox actually run real
+   data science.
+5. **Session API** — for users who want E2B-like persistent semantics
+   when that's the right fit.
 
-1. **M1: cross-build pipeline for arbitrary Python packages.** Wraps
-   wasi-sdk + CPython headers as a build env so `wisp build numpy`
-   produces a WASI-loadable wheel-like artifact. Gateway to numpy →
-   pandas → scikit-learn.
-2. **Spike B3: COW + pooling allocator.** Today the Wasmtime pooling
-   allocator (which would help instantiate cost) is incompatible with
-   `with_host_memory` (which we need for COW). Resolving this should
-   close the gap toward 8-core linear scaling.
-
-This is open-source platform work, no commercial layer. If you build
-on top of it, we'd love to hear what you used it for.
+If you operate an agent framework or platform and the pattern above
+fits something you're hitting, we'd love to hear from you.
 
 — Wisp
