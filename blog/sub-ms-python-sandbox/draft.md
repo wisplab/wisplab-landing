@@ -1,31 +1,49 @@
 # Per-call Python sandboxes in WebAssembly: where Wisp fits
 
-*Draft — 2026-05-03*
+*Updated 2026-05-08*
 
 ---
 
-## TL;DR
+## Working demo, today
 
-Wisp is an open-source Python sandbox runtime that follows the same
-integration model as E2B, Modal Sandbox, Daytona, Blaxel, Vercel
-Sandbox, and Cloudflare Workers — agent frameworks plug it in as their
-"tool execution backend" and ask it to run model-generated Python
-safely.
+In a Claude Code session with the Wisp MCP integration installed:
 
-The substrate is different: WASI Python under Wasmtime instead of a
-Firecracker microVM, gVisor container, or Docker container. That choice
-buys two things the others structurally cannot reach today:
+> *"Use wisp to compute SHA-256 of 'hello world'."*
 
-1. **0.78 ms per-call cold start** at the executor (vs 25 ms warm
-   resume / 90–150 ms cold for the others).
-2. **Per-call fresh sandbox as the default**, not just an option. At a
-   sub-millisecond startup cost, "new sandbox per tool call" is
-   economically the same as "reuse one sandbox" — so we can default to
-   fresh and recover *correctness* properties (no state leakage between
-   tool calls, byte-identical replay) for free.
+```
+[wisp sandbox: rc=0, 1.93 ms]
+b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+```
 
-This post explains where Wisp belongs in the existing landscape — it's a
-**complement, not a replacement** — and walks through how we got the
+That's a fresh CPython 3.14 interpreter — running inside WebAssembly,
+isolated from the host filesystem and network — started in under 2 ms,
+then thrown away. The next tool call gets a brand-new interpreter.
+
+The integration is a single ~120-line Python MCP server plus a Rust
+daemon running locally; full setup is at [Reproduce](#reproduce) below.
+OpenCode users get a similar story via a ~100-line TypeScript custom
+tool. Here's why anyone would bother.
+
+## What Wisp is
+
+A free, open-source **tool-execution backend** for AI agents. Same slot
+as E2B, Modal Sandbox, Daytona, Vercel Sandbox, Blaxel, and Cloudflare
+Workers — the agent framework drives the loop, Wisp runs the
+model-generated Python.
+
+Three deliberate bets vs the typical sandbox provider:
+
+1. **Substrate**: WASI CPython under wasmtime, not Firecracker /
+   gVisor / Docker.
+2. **Default lifecycle**: per-call fresh, not persistent VM. At sub-ms
+   per-call startup the "fresh sandbox per tool call" cost rounds to
+   the same as "reuse one sandbox" — so we default to fresh and get
+   no-cross-call state leakage and byte-identical replay for free.
+3. **Capability model**: explicit allowlists for filesystem, shell,
+   and outbound HTTP, not broad-VM trust.
+
+The position is **complement, not replacement.** Below: where Wisp
+fits, where to keep using one of the others, the design, and the
 numbers.
 
 ---
@@ -317,19 +335,44 @@ exploration), one of the persistent-VM substrates is the right choice.
 Everything in this post is in
 [github.com/wisplab/wisp](https://github.com/wisplab/wisp), MIT-licensed.
 
+**Build the runtime + daemon**:
+
 ```bash
-git clone https://github.com/wisplab/wisp
-cd wisp/runtime/cpython-wasi && ./build.sh        # CPython 3.14 → wasm
+git clone https://github.com/wisplab/wisp && cd wisp
+cd runtime/cpython-wasi && ./build.sh             # CPython 3.14 → wasm
 ./build-sqlite.sh && ./build-openssl.sh           # M0.5 stdlib deps
 ./wisp_entry/build.sh                              # python-reactor.wasm
+cd ../.. && cargo build --release -p wisp-runtime # the daemon
+```
 
-cd ../../bench/python-wasi-cow && cargo run --release            # Spike A2.1
-cd ../python-wasi-cow-branching && cargo run --release            # Spike B2
+**Plug into Claude Code (MCP)**:
 
-# And the daemon + SDK:
-cd ../.. && cargo run --release -p wisp-runtime &
-pip install -e sdks/python
-python -c "import wisp; print(wisp.Client().eval('print(2+2)').stdout)"
+```bash
+cd examples/claude-code-integration
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+
+# In another terminal: start the daemon (capability config optional)
+cargo run --release -p wisp-runtime
+
+# Register the MCP server with Claude Code
+claude mcp add wisp \
+  -- $PWD/.venv/bin/python $PWD/wisp_mcp_server.py
+```
+
+Then in a fresh Claude Code session: *"use wisp to print 2+2"*.
+
+**Plug into OpenCode (custom tool)**:
+
+```bash
+cp -r examples/opencode-integration/.opencode /path/to/your/project/
+# Daemon needs to be running on localhost:9000.
+```
+
+**Reproduce the benchmark numbers**:
+
+```bash
+cd bench/python-wasi-cow            && cargo run --release   # 0.78 ms cold start
+cd ../python-wasi-cow-branching     && cargo run --release   # 2394 br/s parallel
 ```
 
 Each `bench/*/FINDINGS.md` documents the methodology.
@@ -338,19 +381,15 @@ Each `bench/*/FINDINGS.md` documents the methodology.
 
 ## What's next
 
-1. **Daemon-side capabilities** — `shell`, `file_read`, `file_write`,
-   `web_fetch`, `grep`. Configured via allowlist. Without these the
-   sandbox is too narrow for real tool-call workloads.
-2. **Sandbox-side `wisp` Python module** — friendly wrapper around the
-   capability bridge, so user code does `wisp.shell("ls")` instead of
-   raw `_wisp.call_host(...)`.
-3. **Reference integration with one open-source agent framework** —
-   probably smolagents or OpenCode. Not asking them to merge a PR;
-   just a working example so anyone can copy the pattern.
-4. **M1 build pipeline → numpy** — let the sandbox actually run real
-   data science.
-5. **Session API** — for users who want E2B-like persistent semantics
-   when that's the right fit.
+1. **M1 build pipeline → numpy** — let the sandbox actually run real
+   data science. The cross-build pipeline already works end-to-end on
+   xxhash; numpy is the headline test.
+2. **Session API** — E2B-like persistent semantics for the workloads
+   where per-call freshness is the wrong default.
+3. **Multi-host scheduler** — for the Knative-shaped deployment story.
+   Single-process daemon today is fine for solo dev / small team.
+4. **Streaming output** — currently every call runs to completion
+   before returning; long jobs hide useful progress.
 
 If you operate an agent framework or platform and the pattern above
 fits something you're hitting, we'd love to hear from you.

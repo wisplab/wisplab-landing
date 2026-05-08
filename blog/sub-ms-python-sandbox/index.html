@@ -239,18 +239,27 @@
     </div>
 
     <h1>Per-call Python sandboxes in WebAssembly: where Wisp fits</h1>
-    <div class="meta">2026-05-03 · Wisp</div>
+    <div class="meta">Updated 2026-05-08 · Wisp</div>
 
     <article>
 
-      <h2>TL;DR</h2>
-      <p>Wisp is an open-source Python sandbox runtime that follows the same integration model as E2B, Modal Sandbox, Daytona, Blaxel, Vercel Sandbox, and Cloudflare Workers — agent frameworks plug it in as their "tool execution backend" and ask it to run model-generated Python safely.</p>
-      <p>The substrate is different: WASI Python under Wasmtime instead of a Firecracker microVM, gVisor container, or Docker container. That choice buys two things the others structurally cannot reach today:</p>
+      <h2>Working demo, today</h2>
+      <p>In a Claude Code session with the Wisp MCP integration installed:</p>
+      <blockquote><em>"Use wisp to compute SHA-256 of 'hello world'."</em></blockquote>
+      <pre><code>[wisp sandbox: rc=0, 1.93 ms]
+b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9</code></pre>
+      <p>That's a fresh CPython 3.14 interpreter — running inside WebAssembly, isolated from the host filesystem and network — started in under 2 ms, then thrown away. The next tool call gets a brand-new interpreter.</p>
+      <p>The integration is a single ~120-line Python MCP server plus a Rust daemon running locally; full setup is at <a href="#reproduce">Reproduce</a> below. OpenCode users get a similar story via a ~100-line TypeScript custom tool. Here's why anyone would bother.</p>
+
+      <h2>What Wisp is</h2>
+      <p>A free, open-source <strong>tool-execution backend</strong> for AI agents. Same slot as E2B, Modal Sandbox, Daytona, Vercel Sandbox, Blaxel, and Cloudflare Workers — the agent framework drives the loop, Wisp runs the model-generated Python.</p>
+      <p>Three deliberate bets vs the typical sandbox provider:</p>
       <ol>
-        <li><strong>0.78 ms per-call cold start at the executor</strong> (vs 25 ms warm resume / 90–150 ms cold for the others).</li>
-        <li><strong>Per-call fresh sandbox as the default</strong>, not just an option. At a sub-millisecond startup cost, "new sandbox per tool call" is economically the same as "reuse one sandbox" — so we can default to fresh and recover correctness properties (no state leakage between tool calls, byte-identical replay) for free.</li>
+        <li><strong>Substrate</strong>: WASI CPython under wasmtime, not Firecracker / gVisor / Docker.</li>
+        <li><strong>Default lifecycle</strong>: per-call fresh, not persistent VM. At sub-ms per-call startup the "fresh sandbox per tool call" cost rounds to the same as "reuse one sandbox" — so we default to fresh and get no-cross-call state leakage and byte-identical replay for free.</li>
+        <li><strong>Capability model</strong>: explicit allowlists for filesystem, shell, and outbound HTTP, not broad-VM trust.</li>
       </ol>
-      <p>This post explains where Wisp belongs in the existing landscape — it's a <strong>complement, not a replacement</strong> — and walks through how we got the numbers.</p>
+      <p>The position is <strong>complement, not replacement.</strong> Below: where Wisp fits, where to keep using one of the others, the design, and the numbers.</p>
 
       <hr>
 
@@ -410,29 +419,39 @@ let r = libc::mmap(
       </ul>
       <p>For most agent tool calls (parse this JSON, transform that data, validate this schema, do this hash), none of these matter. For some agent workloads (HTTP scraping, browser control, full notebook exploration), one of the persistent-VM substrates is the right choice.</p>
 
-      <h2>Reproduce</h2>
+      <h2 id="reproduce">Reproduce</h2>
       <p>Everything in this post is in <a href="https://github.com/wisplab/wisp">github.com/wisplab/wisp</a>, MIT-licensed.</p>
-      <pre><code>git clone https://github.com/wisplab/wisp
-cd wisp/runtime/cpython-wasi &amp;&amp; ./build.sh        # CPython 3.14 → wasm
+      <p><strong>Build the runtime + daemon</strong>:</p>
+      <pre><code>git clone https://github.com/wisplab/wisp &amp;&amp; cd wisp
+cd runtime/cpython-wasi &amp;&amp; ./build.sh             # CPython 3.14 → wasm
 ./build-sqlite.sh &amp;&amp; ./build-openssl.sh           # M0.5 stdlib deps
 ./wisp_entry/build.sh                              # python-reactor.wasm
+cd ../.. &amp;&amp; cargo build --release -p wisp-runtime # the daemon</code></pre>
+      <p><strong>Plug into Claude Code (MCP)</strong>:</p>
+      <pre><code>cd examples/claude-code-integration
+python3 -m venv .venv &amp;&amp; ./.venv/bin/pip install -r requirements.txt
 
-cd ../../bench/python-wasi-cow &amp;&amp; cargo run --release            # Spike A2.1
-cd ../python-wasi-cow-branching &amp;&amp; cargo run --release            # Spike B2
+# In another terminal: start the daemon (capability config optional)
+cargo run --release -p wisp-runtime
 
-# And the daemon + SDK:
-cd ../.. &amp;&amp; cargo run --release -p wisp-runtime &amp;
-pip install -e sdks/python
-python -c "import wisp; print(wisp.Client().eval('print(2+2)').stdout)"</code></pre>
+# Register the MCP server with Claude Code
+claude mcp add wisp \
+  -- $PWD/.venv/bin/python $PWD/wisp_mcp_server.py</code></pre>
+      <p>Then in a fresh Claude Code session: <em>"use wisp to print 2+2"</em>.</p>
+      <p><strong>Plug into OpenCode (custom tool)</strong>:</p>
+      <pre><code>cp -r examples/opencode-integration/.opencode /path/to/your/project/
+# Daemon needs to be running on localhost:9000.</code></pre>
+      <p><strong>Reproduce the benchmark numbers</strong>:</p>
+      <pre><code>cd bench/python-wasi-cow            &amp;&amp; cargo run --release   # 0.78 ms cold start
+cd ../python-wasi-cow-branching     &amp;&amp; cargo run --release   # 2394 br/s parallel</code></pre>
       <p>Each <code>bench/*/FINDINGS.md</code> documents the methodology.</p>
 
       <h2>What's next</h2>
       <ol>
-        <li><strong>Daemon-side capabilities</strong> — <code>shell</code>, <code>file_read</code>, <code>file_write</code>, <code>web_fetch</code>, <code>grep</code>. Configured via allowlist. Without these the sandbox is too narrow for real tool-call workloads.</li>
-        <li><strong>Sandbox-side <code>wisp</code> Python module</strong> — friendly wrapper around the capability bridge, so user code does <code>wisp.shell("ls")</code> instead of raw <code>_wisp.call_host(...)</code>.</li>
-        <li><strong>Reference integration with one open-source agent framework</strong> — probably smolagents or OpenCode. Not asking them to merge a PR; just a working example so anyone can copy the pattern.</li>
-        <li><strong>M1 build pipeline → numpy</strong> — let the sandbox actually run real data science.</li>
-        <li><strong>Session API</strong> — for users who want E2B-like persistent semantics when that's the right fit.</li>
+        <li><strong>M1 build pipeline → numpy</strong> — let the sandbox actually run real data science. The cross-build pipeline already works end-to-end on xxhash; numpy is the headline test.</li>
+        <li><strong>Session API</strong> — E2B-like persistent semantics for the workloads where per-call freshness is the wrong default.</li>
+        <li><strong>Multi-host scheduler</strong> — for the Knative-shaped deployment story. Single-process daemon today is fine for solo dev / small team.</li>
+        <li><strong>Streaming output</strong> — currently every call runs to completion before returning; long jobs hide useful progress.</li>
       </ol>
       <p>If you operate an agent framework or platform and the pattern above fits something you're hitting, we'd love to hear from you.</p>
 
