@@ -48,6 +48,54 @@ numbers.
 
 ---
 
+## It runs numpy too
+
+The same sandbox in the demo above also runs numpy 1.26, including
+all three subpackages that need C extensions:
+
+```
+> Use wisp to: import numpy as np;
+> A = np.array([[3.0, 1], [1, 2]]); b = np.array([9.0, 8]);
+> print(np.linalg.solve(A, b))
+
+[wisp sandbox: rc=0, 4.45 ms]
+[2. 3.]
+```
+
+```
+> Use wisp to: import numpy as np;
+> x = np.array([1.0, 2.0, 3.0, 4.0]);
+> print(np.fft.ifft(np.fft.fft(x)).round(6))
+
+[wisp sandbox: rc=0, 3.79 ms]
+[1.+0.j 2.-0.j 3.+0.j 4.-0.j]
+```
+
+```
+> Use wisp to: import numpy as np;
+> rng = np.random.default_rng(42);
+> print(rng.standard_normal(5))
+
+[wisp sandbox: rc=0, 5.12 ms]
+[ 0.30471708 -1.03998411  0.7504512   0.94056472 -1.95103519]
+```
+
+Cost: **a 41 MB reactor wasm** instead of a 38 MB one. All three
+came from numpy's own source, cross-compiled to `wasm32-wasip1` via
+the M1 pipeline — `linalg` against numpy's bundled f2c-translated
+reference BLAS+LAPACK (no system BLAS, no Fortran toolchain), `fft`
+against pocketfft, `random` against the 9 cythonized PRNG +
+distribution modules. The build scripts are in
+[`scripts/numpy/`](https://github.com/wisplab/wisp/tree/main/scripts/numpy)
+if you want to extend the runtime with your own C extensions.
+
+Numpy is pre-imported into the snapshot, so per-call latency is the
+same ~5 ms whether or not user code touches it. Per-call
+freshness still holds — each call gets a copy of the post-import
+state, then the copy is thrown away.
+
+---
+
 ## The agent tool-execution problem
 
 A code agent (Claude Code, Aider, OpenCode, Cursor, OpenInterpreter,

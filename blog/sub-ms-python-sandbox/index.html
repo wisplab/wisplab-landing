@@ -263,6 +263,31 @@ b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9</code></pre>
 
       <hr>
 
+      <h2>It runs numpy too</h2>
+      <p>The same sandbox in the demo above also runs numpy 1.26, including all three subpackages that need C extensions:</p>
+      <pre><code>&gt; Use wisp to: import numpy as np;
+&gt; A = np.array([[3.0, 1], [1, 2]]); b = np.array([9.0, 8]);
+&gt; print(np.linalg.solve(A, b))
+
+[wisp sandbox: rc=0, 4.45 ms]
+[2. 3.]</code></pre>
+      <pre><code>&gt; Use wisp to: import numpy as np;
+&gt; x = np.array([1.0, 2.0, 3.0, 4.0]);
+&gt; print(np.fft.ifft(np.fft.fft(x)).round(6))
+
+[wisp sandbox: rc=0, 3.79 ms]
+[1.+0.j 2.-0.j 3.+0.j 4.-0.j]</code></pre>
+      <pre><code>&gt; Use wisp to: import numpy as np;
+&gt; rng = np.random.default_rng(42);
+&gt; print(rng.standard_normal(5))
+
+[wisp sandbox: rc=0, 5.12 ms]
+[ 0.30471708 -1.03998411  0.7504512   0.94056472 -1.95103519]</code></pre>
+      <p>Cost: a <strong>41 MB reactor wasm</strong> instead of a 38 MB one. All three came from numpy's own source, cross-compiled to <code>wasm32-wasip1</code> via the M1 pipeline — <code>linalg</code> against numpy's bundled f2c-translated reference BLAS+LAPACK (no system BLAS, no Fortran toolchain), <code>fft</code> against pocketfft, <code>random</code> against the 9 cythonized PRNG + distribution modules. The build scripts are in <a href="https://github.com/wisplab/wisp/tree/main/scripts/numpy"><code>scripts/numpy/</code></a> if you want to extend the runtime with your own C extensions.</p>
+      <p>Numpy is pre-imported into the snapshot, so per-call latency is the same ~5 ms whether or not user code touches it. Per-call freshness still holds — each call gets a copy of the post-import state, then the copy is thrown away.</p>
+
+      <hr>
+
       <h2>The agent tool-execution problem</h2>
       <p>A code agent (Claude Code, Aider, OpenCode, Cursor, OpenInterpreter, LangChain agents, OpenAI Agents SDK, …) is a loop:</p>
       <pre><code>LLM ─→ "execute this Python" ─→ tool backend runs it ─→ result back to LLM ─→ ...</code></pre>
